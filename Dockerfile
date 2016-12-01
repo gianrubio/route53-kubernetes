@@ -1,7 +1,6 @@
 FROM alpine
 
-RUN apk add --update ca-certificates && \
-    rm -rf /var/cache/apk/* /tmp/*
+RUN apk add --update --no-cache ca-certificates
 
 ENTRYPOINT ["/opt/app/route53-kubernetes"]
 RUN mkdir -p /opt/app

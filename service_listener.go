@@ -21,6 +21,7 @@ import (
 	"k8s.io/kubernetes/pkg/client/transport"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/labels"
+	"k8s.io/kubernetes/pkg/apis/extensions"
 )
 
 // Don't actually commit the changes to route53 records, just print out what we would have done.
@@ -115,59 +116,75 @@ func main() {
 
 	glog.Infof("Starting Service Polling every 30s")
 	for {
-		services, err := c.Services(api.NamespaceAll).List(listOptions)
+		ingresses, err := c.Ingress(api.NamespaceAll).List(listOptions)
 		if err != nil {
 			glog.Fatalf("Failed to list pods: %v", err)
 		}
 
-		glog.Infof("Found %d DNS services in all namespaces with selector %q", len(services.Items), selector)
-		for i := range services.Items {
-			s := &services.Items[i]
-			hn, err := serviceHostname(s)
+		glog.Infof("Found %d DNS ingresses in all namespaces with selector %q", len(ingresses.Items), selector)
+		for i := range ingresses.Items {
+			s := &ingresses.Items[i]
+			hn, err := ingressHostname(s)
 			if err != nil {
 				glog.Warningf("Couldn't find hostname for %s: %s", s.Name, err)
 				continue
 			}
 
-			annotation, ok := s.ObjectMeta.Annotations["domainName"]
+			internalElbName, ok := s.ObjectMeta.Annotations["internalElbName"]
+
 			if !ok {
-				glog.Warningf("Domain name not set for %s", s.Name)
+				glog.Warningf("Internal elb name not set for %s", s.Name)
 				continue
 			}
 
-			domains := strings.Split(annotation, ",")
+			externalElbName, ok := s.ObjectMeta.Annotations["externalElbName"]
+
+			if !ok {
+				glog.Warningf("External elb name not set for %s", s.Name)
+				continue
+			}
+
+			domains := strings.Split(hn, ",")
 			for j := range domains {
-				domain := domains[j]
 
-				glog.Infof("Creating DNS for %s service: %s -> %s", s.Name, hn, domain)
-				elbZoneID, err := hostedZoneID(elbAPI, hn)
-				if err != nil {
-					glog.Warningf("Couldn't get zone ID: %s", err)
-					continue
+				for _, isPrivate := range [2]bool{true, false}  {
+
+					domain := domains[j]
+					elbName := externalElbName
+
+					if isPrivate {
+						elbName = internalElbName
+					}
+
+					elbZoneID, err := hostedZoneID(elbAPI, elbName)
+					if err != nil {
+						glog.Warningf("Couldn't get zone ID: %s", err)
+						continue
+					}
+
+					zone, err := getDestinationZone(domain, isPrivate, r53Api)
+					if err != nil {
+						glog.Warningf("Couldn't find destination zone: %s", err)
+						continue
+					}
+
+					zoneID := *zone.Id
+					zoneParts := strings.Split(zoneID, "/")
+					zoneID = zoneParts[len(zoneParts)-1]
+
+					if err = updateDNS(r53Api, elbName, elbZoneID, strings.TrimLeft(domain, "."), zoneID); err != nil {
+						glog.Warning(err)
+						continue
+					}
+
 				}
-
-				zone, err := getDestinationZone(domain, r53Api)
-				if err != nil {
-					glog.Warningf("Couldn't find destination zone: %s", err)
-					continue
-				}
-
-				zoneID := *zone.Id
-				zoneParts := strings.Split(zoneID, "/")
-				zoneID = zoneParts[len(zoneParts)-1]
-
-				if err = updateDNS(r53Api, hn, elbZoneID, strings.TrimLeft(domain, "."), zoneID); err != nil {
-					glog.Warning(err)
-					continue
-				}
-				glog.Infof("Created dns record set: domain=%s, zoneID=%s", domain, zoneID)
 			}
 		}
-		time.Sleep(30 * time.Second)
+		time.Sleep(15 * time.Second)
 	}
 }
 
-func getDestinationZone(domain string, r53Api *route53.Route53) (*route53.HostedZone, error) {
+func getDestinationZone(domain string, isPrivateZone bool, r53Api *route53.Route53) (*route53.HostedZone, error) {
 	tld, err := getTLD(domain)
 	if err != nil {
 		return nil, err
@@ -182,10 +199,10 @@ func getDestinationZone(domain string, r53Api *route53.Route53) (*route53.Hosted
 	}
 	// TODO: The AWS API may return multiple pages, we should parse them all
 
-	return findMostSpecificZoneForDomain(domain, hzOut.HostedZones)
+	return findMostSpecificZoneForDomain(domain, isPrivateZone, hzOut.HostedZones)
 }
 
-func findMostSpecificZoneForDomain(domain string, zones []*route53.HostedZone) (*route53.HostedZone, error) {
+func findMostSpecificZoneForDomain(domain string, isPrivateZone bool, zones []*route53.HostedZone) (*route53.HostedZone, error) {
 	domain = domainWithTrailingDot(domain)
 	if len(zones) < 1 {
 		return nil, fmt.Errorf("No zone found for %s", domain)
@@ -196,8 +213,9 @@ func findMostSpecificZoneForDomain(domain string, zones []*route53.HostedZone) (
 	for i := range zones {
 		zone := zones[i]
 		zoneName := *zone.Name
+		zoneIsPrivate := *zone.Config.PrivateZone
 
-		if strings.HasSuffix(domain, zoneName) && curLen < len(zoneName) {
+		if strings.HasSuffix(domain, zoneName) && zoneIsPrivate == isPrivateZone && curLen < len(zoneName) {
 			curLen = len(zoneName)
 			mostSpecific = zone
 		}
@@ -237,6 +255,18 @@ func serviceHostname(service *api.Service) (string, error) {
 	return ingress[0].Hostname, nil
 }
 
+func ingressHostname(ingress *extensions.Ingress) (string, error) {
+	xb := ingress.Spec.Rules
+	if len(xb) < 1 {
+		return "", errors.New("No ingress defined for ELB")
+	}
+	if len(xb) > 1 {
+		return "", errors.New("Multiple ingress points found for ELB, not supported")
+	}
+	glog.Infof("Hostname found: %s", xb[0].Host)
+	return xb[0].Host, nil
+}
+
 func loadBalancerNameFromHostname(hostname string) (string, error) {
 	var name string
 	hostnameSegments := strings.Split(hostname, "-")
@@ -247,14 +277,16 @@ func loadBalancerNameFromHostname(hostname string) (string, error) {
 
 	// handle internal load balancer naming
 	if name == "internal" {
-		name = hostnameSegments[1]
+		name = strings.Join(hostnameSegments[1:4],"-")
 	}
 
 	return name, nil
 }
 
 func hostedZoneID(elbAPI *elb.ELB, hostname string) (string, error) {
+
 	elbName, err := loadBalancerNameFromHostname(hostname)
+
 	if err != nil {
 		return "", fmt.Errorf("Couldn't parse ELB hostname: %v", err)
 	}
@@ -278,36 +310,60 @@ func hostedZoneID(elbAPI *elb.ELB, hostname string) (string, error) {
 }
 
 func updateDNS(r53Api *route53.Route53, hn, hzID, domain, zoneID string) error {
-	at := route53.AliasTarget{
+
+	listParams := &route53.ListResourceRecordSetsInput{
+		HostedZoneId: &zoneID,
+		StartRecordName: &domain,
+		StartRecordType: aws.String("A"),
+	}
+
+	respList, err := r53Api.ListResourceRecordSets(listParams)
+	elbHostname := &hn
+
+	if len(respList.ResourceRecordSets) > 0 && strings.EqualFold(strings.Trim(*respList.ResourceRecordSets[0].AliasTarget.DNSName, "."), *elbHostname) {
+		glog.Infof("No changes in route53 recordset %s", hn)
+		return nil
+
+	}else{
+
+		at := route53.AliasTarget{
 		DNSName:              &hn,
 		EvaluateTargetHealth: aws.Bool(false),
 		HostedZoneId:         &hzID,
-	}
-	rrs := route53.ResourceRecordSet{
-		AliasTarget: &at,
-		Name:        &domain,
-		Type:        aws.String("A"),
-	}
-	change := route53.Change{
-		Action:            aws.String("UPSERT"),
-		ResourceRecordSet: &rrs,
-	}
-	batch := route53.ChangeBatch{
-		Changes: []*route53.Change{&change},
-		Comment: aws.String("Kubernetes Update to Service"),
-	}
-	crrsInput := route53.ChangeResourceRecordSetsInput{
-		ChangeBatch:  &batch,
-		HostedZoneId: &zoneID,
-	}
-	if dryRun {
-		glog.Infof("DRY RUN: We normally would have updated %s to point to %s (%s)", zoneID, hzID, hn)
-		return nil
-	}
+		}
+		rrs := route53.ResourceRecordSet{
+			AliasTarget: &at,
+			Name:        &domain,
+			Type:        aws.String("A"),
+		}
+		change := route53.Change{
+			Action:            aws.String("UPSERT"),
+			ResourceRecordSet: &rrs,
+		}
+		batch := route53.ChangeBatch{
+			Changes: []*route53.Change{&change},
+			Comment: aws.String("Kubernetes Update to Service"),
+		}
 
-	_, err := r53Api.ChangeResourceRecordSets(&crrsInput)
-	if err != nil {
-		return fmt.Errorf("Failed to update record set: %v", err)
+		crrsInput := route53.ChangeResourceRecordSetsInput{
+			ChangeBatch:  &batch,
+			HostedZoneId: &zoneID,
+		}
+		if dryRun {
+			glog.Infof("DRY RUN: We normally would have updated %s to point to %s (%s)", zoneID, hzID, hn)
+			return nil
+		}else{
+			glog.Infof("Creating %s recordset %s to point to %s (%s)", zoneID, hzID, hn)
+
+		}
+
+		glog.Infof("Created dns record set: domain=%s, zoneID=%s", domain, zoneID)
+
+
+		_, err = r53Api.ChangeResourceRecordSets(&crrsInput)
+		if err != nil {
+			return fmt.Errorf("Failed to update record set: %v", err)
+		}
 	}
 	return nil
 }
