@@ -80,22 +80,33 @@ func main() {
 	}
 	glog.Infof("Connected to kubernetes @ %s", config.Host)
 
-	metadata := ec2metadata.New(session.New())
+	awsConfig := aws.NewConfig()
 
-	creds := credentials.NewChainCredentials(
-		[]credentials.Provider{
-			&credentials.EnvProvider{},
-			&credentials.SharedCredentialsProvider{},
-			&ec2rolecreds.EC2RoleProvider{Client: metadata},
-		})
+	awsAccessKeyId := os.Getenv("AWS_ACCESS_KEY_ID")
+	awsSecretAccessKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	region := os.Getenv("AWS_REGION")
 
-	region, err := metadata.Region()
-	if err != nil {
-		glog.Fatalf("Unable to retrieve the region from the EC2 instance %v\n", err)
+	// aws credentials based on role
+	if awsAccessKeyId == "" || awsSecretAccessKey == "" || region == ""{
+
+		metadata := ec2metadata.New(session.New())
+
+		creds := credentials.NewChainCredentials(
+			[]credentials.Provider{
+				&credentials.EnvProvider{},
+				&credentials.SharedCredentialsProvider{},
+				&ec2rolecreds.EC2RoleProvider{Client: metadata},
+			})
+
+		region, err = metadata.Region()
+		if err != nil {
+			glog.Fatalf("Unable to retrieve the region from the EC2 instance %v\n", err)
+		}
+
+
+		awsConfig.WithCredentials(creds)
 	}
 
-	awsConfig := aws.NewConfig()
-	awsConfig.WithCredentials(creds)
 	awsConfig.WithRegion(region)
 	sess := session.New(awsConfig)
 
